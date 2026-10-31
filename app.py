@@ -1,4 +1,6 @@
 import math
+import time
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -26,43 +28,82 @@ LEAGUES = {
 }
 
 
-# -----------------------------
-# API CONNECTION
-# -----------------------------
+# =====================================
+# API DATA FETCHING WITH CACHING
+# =====================================
 
-def get(path, token, params=None):
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_matches(
+    competition,
+    date_from,
+    date_to,
+    token_hash,
+    _token
+):
 
-    response = requests.get(
-        BASE + path,
-        headers={"X-Auth-Token": token.strip()},
-        params=params or {},
-        timeout=25
-    )
+    url = f"{BASE}/competitions/{competition}/matches"
 
-    if response.status_code == 401:
-        raise RuntimeError("Invalid API token.")
+    headers = {
+        "X-Auth-Token": _token.strip()
+    }
 
-    if response.status_code == 403:
-        raise RuntimeError(
-            "Your free plan does not include this competition."
+    params = {
+        "dateFrom": date_from,
+        "dateTo": date_to
+    }
+
+    for attempt in range(2):
+
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=30
         )
 
-    if response.status_code == 429:
-        raise RuntimeError(
-            "API request limit reached. Wait before trying again."
-        )
+        if response.status_code == 429:
 
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"API error {response.status_code}: {response.text[:200]}"
-        )
+            if attempt == 0:
 
-    return response.json()
+                retry = response.headers.get(
+                    "Retry-After", "10"
+                )
+
+                try:
+                    wait = min(max(int(retry), 5), 60)
+                except ValueError:
+                    wait = 10
+
+                time.sleep(wait)
+                continue
+
+            raise RuntimeError(
+                "API request limit reached. "
+                "Please wait before trying again."
+            )
+
+        if response.status_code == 401:
+            raise RuntimeError("Invalid API token.")
+
+        if response.status_code == 403:
+            raise RuntimeError(
+                "Your free plan does not include this competition."
+            )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"API error {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+
+        return response.json()
+
+    raise RuntimeError("Unable to retrieve match data.")
 
 
-# -----------------------------
+# =====================================
 # DATE HANDLING
-# -----------------------------
+# =====================================
 
 def match_date(match):
 
@@ -76,9 +117,9 @@ def match_date(match):
     )
 
 
-# -----------------------------
-# ELO TEAM STRENGTH MODEL
-# -----------------------------
+# =====================================
+# BUILD ELO MODEL
+# =====================================
 
 def build_model(history):
 
@@ -86,7 +127,9 @@ def build_model(history):
 
     for match in history:
 
-        score = match.get("score", {}).get("fullTime", {})
+        score = match.get(
+            "score", {}
+        ).get("fullTime", {})
 
         if (
             match.get("status") == "FINISHED"
@@ -95,11 +138,20 @@ def build_model(history):
         ):
 
             matches.append({
+
                 "date": match_date(match),
-                "home": match.get("homeTeam", {}).get("name"),
-                "away": match.get("awayTeam", {}).get("name"),
+
+                "home": match.get(
+                    "homeTeam", {}
+                ).get("name"),
+
+                "away": match.get(
+                    "awayTeam", {}
+                ).get("name"),
+
                 "hg": int(score["home"]),
                 "ag": int(score["away"])
+
             })
 
     matches.sort(key=lambda x: x["date"])
@@ -107,8 +159,8 @@ def build_model(history):
     ratings = {}
     records = {}
 
-    total_home_goals = 0
-    total_away_goals = 0
+    total_home = 0
+    total_away = 0
 
     for match in matches:
 
@@ -124,53 +176,52 @@ def build_model(history):
         records.setdefault(home, [])
         records.setdefault(away, [])
 
-        home_rating = ratings[home]
-        away_rating = ratings[away]
-
-        # Home advantage in Elo points
-        expected_home = 1 / (
-            1 + 10 ** ((away_rating - home_rating - 55) / 400)
+        expected = 1 / (
+            1 + 10 ** (
+                (
+                    ratings[away]
+                    - ratings[home]
+                    - 55
+                ) / 400
+            )
         )
 
         if hg > ag:
-            actual_home = 1
-
+            actual = 1
         elif hg == ag:
-            actual_home = 0.5
-
+            actual = 0.5
         else:
-            actual_home = 0
+            actual = 0
 
-        # Goal difference adjustment
+        # Corrected Elo update:
+        # Draws must also update ratings.
+
         goal_difference = abs(hg - ag)
 
-        adjustment = math.log1p(goal_difference)
-
-        k_factor = 20 * min(adjustment, 1.5)
-
-        change = k_factor * (
-            actual_home - expected_home
+        k_factor = 20 * (
+            1 + 0.5 * min(
+                math.log1p(goal_difference), 1.5
+            )
         )
+
+        change = k_factor * (actual - expected)
 
         ratings[home] += change
         ratings[away] -= change
 
-        # Store team performance
         if hg > ag:
-            home_points, away_points = 3, 0
-
+            hp, ap = 3, 0
         elif hg == ag:
-            home_points, away_points = 1, 1
-
+            hp, ap = 1, 1
         else:
-            home_points, away_points = 0, 3
+            hp, ap = 0, 3
 
         records[home].append({
             "date": match["date"],
             "venue": "home",
             "gf": hg,
             "ga": ag,
-            "points": home_points
+            "points": hp
         })
 
         records[away].append({
@@ -178,34 +229,35 @@ def build_model(history):
             "venue": "away",
             "gf": ag,
             "ga": hg,
-            "points": away_points
+            "points": ap
         })
 
-        total_home_goals += hg
-        total_away_goals += ag
+        total_home += hg
+        total_away += ag
 
     count = len(matches)
 
-    avg_home = (
-        total_home_goals / count if count else 1.45
-    )
-
-    avg_away = (
-        total_away_goals / count if count else 1.15
-    )
-
     return {
+
         "ratings": ratings,
         "records": records,
-        "avg_home": avg_home,
-        "avg_away": avg_away,
+
+        "avg_home": (
+            total_home / count if count else 1.45
+        ),
+
+        "avg_away": (
+            total_away / count if count else 1.15
+        ),
+
         "matches": count
+
     }
 
 
-# -----------------------------
+# =====================================
 # WEIGHTED TEAM STATISTICS
-# -----------------------------
+# =====================================
 
 def weighted_average(records, field):
 
@@ -214,28 +266,25 @@ def weighted_average(records, field):
 
     now = datetime.now(timezone.utc)
 
-    weighted_total = 0
-    total_weight = 0
+    total = 0
+    weights = 0
 
     for record in records:
 
         age = max(
             0,
-            (now - record["date"]).total_seconds() / 86400
+            (now - record["date"]).total_seconds()
+            / 86400
         )
 
-        # Recent matches receive greater weight.
         weight = math.exp(
             -math.log(2) * age / 60
         )
 
-        weighted_total += record[field] * weight
-        total_weight += weight
+        total += record[field] * weight
+        weights += weight
 
-    if total_weight == 0:
-        return 0
-
-    return weighted_total / total_weight
+    return total / weights if weights else 0
 
 
 def team_statistics(model, team, venue):
@@ -243,6 +292,7 @@ def team_statistics(model, team, venue):
     records = model["records"].get(team, [])
 
     if not records:
+
         return {
             "attack": 1.0,
             "defence": 1.0,
@@ -250,50 +300,45 @@ def team_statistics(model, team, venue):
             "samples": 0
         }
 
-    overall_gf = weighted_average(records, "gf")
-    overall_ga = weighted_average(records, "ga")
-    overall_points = weighted_average(records, "points")
+    gf = weighted_average(records, "gf")
+    ga = weighted_average(records, "ga")
 
     venue_records = [
-        r for r in records if r["venue"] == venue
+        r for r in records
+        if r["venue"] == venue
     ]
 
     if venue_records:
 
-        venue_gf = weighted_average(venue_records, "gf")
-        venue_ga = weighted_average(venue_records, "ga")
+        vgf = weighted_average(
+            venue_records, "gf"
+        )
 
-        # Shrink small venue samples towards overall performance.
+        vga = weighted_average(
+            venue_records, "ga"
+        )
+
         factor = len(venue_records) / (
             len(venue_records) + 5
         )
 
-        gf = (
-            factor * venue_gf
-            + (1 - factor) * overall_gf
-        )
-
-        ga = (
-            factor * venue_ga
-            + (1 - factor) * overall_ga
-        )
-
-    else:
-        gf = overall_gf
-        ga = overall_ga
+        gf = factor * vgf + (1 - factor) * gf
+        ga = factor * vga + (1 - factor) * ga
 
     if venue == "home":
-        scoring_baseline = model["avg_home"]
-        conceding_baseline = model["avg_away"]
+
+        scoring_base = model["avg_home"]
+        conceding_base = model["avg_away"]
+
     else:
-        scoring_baseline = model["avg_away"]
-        conceding_baseline = model["avg_home"]
 
-    attack = gf / max(scoring_baseline, 0.1)
+        scoring_base = model["avg_away"]
+        conceding_base = model["avg_home"]
 
-    defence = ga / max(conceding_baseline, 0.1)
+    attack = gf / max(scoring_base, 0.1)
 
-    # Recent form: last five matches.
+    defence = ga / max(conceding_base, 0.1)
+
     recent = sorted(
         records,
         key=lambda r: r["date"],
@@ -301,56 +346,76 @@ def team_statistics(model, team, venue):
     )[:5]
 
     form = (
-        sum(r["points"] for r in recent) / len(recent)
-        if recent else overall_points
+        sum(r["points"] for r in recent)
+        / len(recent)
+        if recent else 1.35
     )
 
     return {
-        "attack": max(0.35, min(2.5, attack)),
-        "defence": max(0.35, min(2.5, defence)),
+
+        "attack": max(
+            0.35, min(2.5, attack)
+        ),
+
+        "defence": max(
+            0.35, min(2.5, defence)
+        ),
+
         "form": form,
+
         "samples": len(venue_records)
+
     }
 
 
-# -----------------------------
-# POISSON PROBABILITY
-# -----------------------------
+# =====================================
+# POISSON MODEL
+# =====================================
 
 def poisson(lam):
 
-    probabilities = [
-        math.exp(-lam) * lam ** k / math.factorial(k)
+    values = [
+        math.exp(-lam)
+        * lam ** k
+        / math.factorial(k)
         for k in range(11)
     ]
 
-    total = sum(probabilities)
+    total = sum(values)
 
-    return [p / total for p in probabilities]
+    return [x / total for x in values]
 
 
-# -----------------------------
+# =====================================
 # MATCH PREDICTION ENGINE
-# -----------------------------
+# =====================================
 
 def predict(model, home, away):
 
-    hs = team_statistics(model, home, "home")
-    aws = team_statistics(model, away, "away")
+    hs = team_statistics(
+        model, home, "home"
+    )
+
+    aws = team_statistics(
+        model, away, "away"
+    )
 
     ratings = model["ratings"]
 
     home_elo = ratings.get(home, 1500)
     away_elo = ratings.get(away, 1500)
 
-    # Elo advantage, including home advantage.
-    elo_difference = home_elo + 55 - away_elo
-
-    elo_factor = math.exp(
-        max(-0.25, min(0.25, elo_difference / 3000))
+    elo_difference = (
+        home_elo + 55 - away_elo
     )
 
-    # Team attacking and defensive strengths.
+    elo_factor = math.exp(
+        max(
+            -0.25,
+            min(0.25, elo_difference / 3000)
+        )
+    )
+
     home_goals = (
         model["avg_home"]
         * hs["attack"]
@@ -363,19 +428,17 @@ def predict(model, home, away):
         * hs["defence"]
     )
 
-    # Recent form adjustment.
-    home_form_factor = math.exp(
+    home_form = math.exp(
         (hs["form"] - 1.35) * 0.08
     )
 
-    away_form_factor = math.exp(
+    away_form = math.exp(
         (aws["form"] - 1.35) * 0.08
     )
 
-    # Final expected goals.
-    lh = home_goals * elo_factor * home_form_factor
+    lh = home_goals * elo_factor * home_form
 
-    la = away_goals / elo_factor * away_form_factor
+    la = away_goals / elo_factor * away_form
 
     lh = max(0.15, min(4.5, lh))
     la = max(0.15, min(4.5, la))
@@ -384,42 +447,46 @@ def predict(model, home, away):
     pa = poisson(la)
 
     hw = dr = aw = 0
+
     ov15 = ov25 = ov35 = un25 = btts = 0
 
     for i, pi in enumerate(ph):
 
         for j, pj in enumerate(pa):
 
-            probability = pi * pj
+            p = pi * pj
 
             if i > j:
-                hw += probability
+                hw += p
 
             elif i == j:
-                dr += probability
+                dr += p
 
             else:
-                aw += probability
+                aw += p
 
             if i + j >= 2:
-                ov15 += probability
+                ov15 += p
 
             if i + j >= 3:
-                ov25 += probability
+                ov25 += p
 
             if i + j >= 4:
-                ov35 += probability
+                ov35 += p
 
             if i + j <= 2:
-                un25 += probability
+                un25 += p
 
             if i >= 1 and j >= 1:
-                btts += probability
+                btts += p
 
-    def strength_score(rating):
+    def strength(rating):
 
         return round(
-            max(0, min(100, 50 + (rating - 1500) / 8)),
+            max(
+                0,
+                min(100, 50 + (rating - 1500) / 8)
+            ),
             1
         )
 
@@ -431,8 +498,8 @@ def predict(model, home, away):
         "Home Elo": round(home_elo),
         "Away Elo": round(away_elo),
 
-        "Home strength /100": strength_score(home_elo),
-        "Away strength /100": strength_score(away_elo),
+        "Home strength /100": strength(home_elo),
+        "Away strength /100": strength(away_elo),
 
         "Home attack": round(hs["attack"], 2),
         "Away attack": round(aws["attack"], 2),
@@ -454,23 +521,24 @@ def predict(model, home, away):
         "Under 2.5 %": round(un25 * 100, 1),
 
         "BTTS Yes %": round(btts * 100, 1),
-        "BTTS No %": round((1 - btts) * 100, 1),
+        "BTTS No %": round((1-btts) * 100, 1),
 
         "Home samples": hs["samples"],
         "Away samples": aws["samples"]
+
     }
 
 
-# -----------------------------
-# DASHBOARD DISPLAY
-# -----------------------------
+# =====================================
+# DASHBOARD
+# =====================================
 
-st.title("⚽ Football Analysis Dashboard — V4")
+st.title("⚽ Football Analysis Dashboard — V4.1")
 
 st.write(
-    "Team-strength analysis using Elo ratings, "
-    "attacking strength, defensive strength, "
-    "recent form and Poisson probabilities."
+    "Advanced football analysis using team strength, "
+    "Elo ratings, attack, defence, recent form "
+    "and Poisson probabilities."
 )
 
 with st.sidebar:
@@ -495,7 +563,7 @@ with st.sidebar:
     )
 
     days = st.selectbox(
-        "Recent-results window (days)",
+        "Recent-results window",
         [30, 60, 90],
         index=1
     )
@@ -505,11 +573,19 @@ with st.sidebar:
         type="primary"
     )
 
+    if st.button("Clear cached data"):
+
+        st.cache_data.clear()
+
+        st.success(
+            "Cached data cleared. Reload your matches."
+        )
+
 
 if not token:
 
     st.info(
-        "Open the sidebar and enter your football-data.org API token."
+        "Open the sidebar and enter your private API token."
     )
 
     st.stop()
@@ -527,10 +603,19 @@ if go:
 
     end = today.isoformat()
 
+    token_hash = hashlib.sha256(
+        token.encode()
+    ).hexdigest()
+
     rows = []
     errors = []
+    status_rows = []
 
     bar = st.progress(0)
+
+    progress_text = st.empty()
+
+    last_request = 0
 
     for i, name in enumerate(selected):
 
@@ -538,18 +623,39 @@ if go:
 
         try:
 
-            day = get(
-                f"/competitions/{code}/matches",
-                token,
-                {
-                    "dateFrom": today.isoformat(),
-                    "dateTo": today.isoformat()
-                }
-            ).get("matches", [])
+            progress_text.write(
+                f"Loading {name}..."
+            )
+
+            # Avoid rapid requests.
+            elapsed = time.monotonic() - last_request
+
+            if elapsed < 1.2 and last_request:
+                time.sleep(1.2 - elapsed)
+
+            last_request = time.monotonic()
+
+            # One API request supplies both history
+            # and today's fixtures.
+
+            data = fetch_matches(
+                code,
+                start,
+                end,
+                token_hash,
+                token
+            )
+
+            matches = data.get("matches", [])
+
+            history = [
+                m for m in matches
+                if m.get("status") == "FINISHED"
+            ]
 
             upcoming = []
 
-            for match in day:
+            for match in matches:
 
                 kickoff = match_date(match)
 
@@ -563,53 +669,54 @@ if go:
 
                     upcoming.append(match)
 
-            if upcoming:
+            model = build_model(history)
 
-                history = get(
-                    f"/competitions/{code}/matches",
-                    token,
-                    {
-                        "dateFrom": start,
-                        "dateTo": end,
-                        "status": "FINISHED"
-                    }
-                ).get("matches", [])
+            status_rows.append({
 
-                model = build_model(history)
+                "Competition": name,
+                "Historical matches": model["matches"],
+                "Upcoming matches": len(upcoming),
+                "Data retrieved": datetime.now().strftime(
+                    "%H:%M:%S"
+                )
 
-                for match in upcoming:
+            })
 
-                    home = match.get(
-                        "homeTeam", {}
-                    ).get("name", "Home")
+            for match in upcoming:
 
-                    away = match.get(
-                        "awayTeam", {}
-                    ).get("name", "Away")
+                home = match.get(
+                    "homeTeam", {}
+                ).get("name", "Home")
 
-                    kickoff = match_date(match).astimezone().strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
+                away = match.get(
+                    "awayTeam", {}
+                ).get("name", "Away")
 
-                    prediction = predict(
-                        model,
-                        home,
-                        away
-                    )
+                kickoff = match_date(
+                    match
+                ).astimezone().strftime(
+                    "%Y-%m-%d %H:%M"
+                )
 
-                    rows.append({
+                prediction = predict(
+                    model,
+                    home,
+                    away
+                )
 
-                        "Competition": name,
+                rows.append({
 
-                        "Kickoff (device time)": kickoff,
+                    "Competition": name,
 
-                        "Home team": home,
+                    "Kickoff (device time)": kickoff,
 
-                        "Away team": away,
+                    "Home team": home,
 
-                        **prediction
+                    "Away team": away,
 
-                    })
+                    **prediction
+
+                })
 
         except Exception as e:
 
@@ -621,25 +728,41 @@ if go:
             (i + 1) / max(1, len(selected))
         )
 
+    progress_text.empty()
+
     if errors:
 
         st.warning(
-            "Some competitions could not be loaded."
+            "Some competitions could not be loaded. "
+            "Other successful competitions are preserved."
         )
 
         for error in errors:
             st.write("• " + error)
+
+    if status_rows:
+
+        st.subheader("Data loading report")
+
+        st.dataframe(
+            pd.DataFrame(status_rows),
+            use_container_width=True,
+            hide_index=True
+        )
 
     if rows:
 
         df = pd.DataFrame(rows)
 
         df = df.sort_values(
-            ["Kickoff (device time)", "Competition"]
+            [
+                "Kickoff (device time)",
+                "Competition"
+            ]
         )
 
         st.success(
-            f"Loaded {len(df)} upcoming matches."
+            f"Successfully loaded {len(df)} upcoming matches."
         )
 
         st.subheader("Today's Match Predictions")
@@ -653,34 +776,39 @@ if go:
         st.download_button(
             "Download analysis as CSV",
             df.to_csv(index=False).encode(),
-            "football_analysis_v4.csv",
+            "football_analysis_v41.csv",
             "text/csv"
         )
 
-        st.subheader("How to interpret the ratings")
+        st.subheader("Understanding the model")
 
         st.write("""
-        - **Elo:** Higher ratings indicate stronger historical performance.
-        - **Attack:** Above 1.00 indicates above-average scoring.
-        - **Defence:** Below 1.00 indicates fewer goals conceded than average.
-        - **Form PPG:** Points per game over the team's last five matches.
-        - **Expected goals:** Estimated goals for each team.
-        - **Strength /100:** A simplified display of the Elo rating, not a percentage chance of winning.
+        **Elo:** Measures historical team strength.
+
+        **Attack:** Above 1.00 indicates above-average scoring.
+
+        **Defence:** Below 1.00 indicates fewer goals conceded.
+
+        **Form PPG:** Points per game over the last five matches.
+
+        **Expected goals:** Estimated goals for each team.
+
+        **Strength /100:** A transformed Elo rating, not a
+        probability of winning.
         """)
 
         st.caption(
-            "The model uses completed matches within your selected "
-            "history window. Predictions are estimates, not guarantees. "
-            "It does not yet include injuries, suspensions, confirmed "
-            "lineups, odds or weather. Short history windows can produce "
-            "less reliable ratings."
+            "Predictions are statistical estimates, not guarantees. "
+            "The model does not yet include injuries, suspensions, "
+            "confirmed lineups, betting odds or weather. "
+            "Short history windows may reduce reliability."
         )
 
     else:
 
         st.info(
-            "No upcoming matches were returned for today, "
-            "or your API plan does not include the selected competitions."
+            "No upcoming matches were returned for today "
+            "in the selected competitions."
         )
 
 else:

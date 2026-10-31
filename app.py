@@ -1,109 +1,691 @@
 import math
 from datetime import datetime, timedelta, timezone
+
 import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title='Free Football Analysis Dashboard', page_icon='⚽', layout='wide')
-BASE='https://api.football-data.org/v4'
-LEAGUES={'Premier League (England)':'PL','La Liga (Spain)':'PD','Bundesliga (Germany)':'BL1','Serie A (Italy)':'SA','Ligue 1 (France)':'FL1','Champions League':'CL','Europa League':'EL','Eredivisie (Netherlands)':'DED','Primeira Liga (Portugal)':'PPL'}
+st.set_page_config(
+    page_title="Football Analysis Dashboard",
+    page_icon="⚽",
+    layout="wide"
+)
+
+BASE = "https://api.football-data.org/v4"
+
+LEAGUES = {
+    "Premier League (England)": "PL",
+    "La Liga (Spain)": "PD",
+    "Bundesliga (Germany)": "BL1",
+    "Serie A (Italy)": "SA",
+    "Ligue 1 (France)": "FL1",
+    "Champions League": "CL",
+    "Europa League": "EL",
+    "Eredivisie (Netherlands)": "DED",
+    "Primeira Liga (Portugal)": "PPL"
+}
+
+
+# -----------------------------
+# API CONNECTION
+# -----------------------------
 
 def get(path, token, params=None):
-    r=requests.get(BASE+path, headers={'X-Auth-Token':token.strip()}, params=params or {}, timeout=25)
-    if r.status_code==401: raise RuntimeError('Token rejected. Check that it was copied correctly.')
-    if r.status_code==403: raise RuntimeError('Your free plan does not include this competition/resource. Try another competition.')
-    if r.status_code==429: raise RuntimeError('API request limit reached. Wait before trying again.')
-    if r.status_code>=400: raise RuntimeError(f'API error {r.status_code}: {r.text[:250]}')
-    return r.json()
 
-def pois(lam):
-    p=[math.exp(-lam)*lam**k/math.factorial(k) for k in range(11)]
-    s=sum(p)
-    return [x/s for x in p]
+    response = requests.get(
+        BASE + path,
+        headers={"X-Auth-Token": token.strip()},
+        params=params or {},
+        timeout=25
+    )
 
-def predict(history, home, away):
-    done=[]
-    for m in history:
-        sc=m.get('score',{}).get('fullTime',{})
-        if m.get('status')=='FINISHED' and sc.get('home') is not None and sc.get('away') is not None:
-            done.append((m,int(sc['home']),int(sc['away'])))
-    done.sort(key=lambda x:x[0].get('utcDate',''),reverse=True)
-    def sample(team, venue):
-        out=[]
-        for m,h,a in done:
-            hn=m.get('homeTeam',{}).get('name',''); an=m.get('awayTeam',{}).get('name','')
-            if venue=='home' and hn==team: out.append((h,a))
-            elif venue=='away' and an==team: out.append((a,h))
-            if len(out)>=5: break
-        if len(out)<2:
-            out=[]
-            for m,h,a in done:
-                hn=m.get('homeTeam',{}).get('name',''); an=m.get('awayTeam',{}).get('name','')
-                if hn==team: out.append((h,a))
-                elif an==team: out.append((a,h))
-                if len(out)>=5: break
-        return out
-    hs=sample(home,'home'); aws=sample(away,'away')
-    allh=[h for _,h,a in done]; alla=[a for _,h,a in done]
-    bh=sum(allh)/len(allh) if allh else 1.35; ba=sum(alla)/len(alla) if alla else 1.10
-    hfor=sum(x for x,y in hs)/len(hs) if hs else bh
-    hagain=sum(y for x,y in hs)/len(hs) if hs else ba
-    afor=sum(x for x,y in aws)/len(aws) if aws else ba
-    aagainst=sum(y for x,y in aws)/len(aws) if aws else bh
-    lh=max(.15,min(4,(hfor+aagainst)/2)); la=max(.15,min(4,(afor+hagain)/2))
-    ph,pa=pois(lh),pois(la); hw=dr=aw=ov15=ov25=un25=btts=0
-    for i,pi in enumerate(ph):
-        for j,pj in enumerate(pa):
-            p=pi*pj
-            if i>j: hw+=p
-            elif i==j: dr+=p
-            else: aw+=p
-            if i+j>=2: ov15+=p
-            if i+j>=3: ov25+=p
-            if i+j<=2: un25+=p
-            if i>=1 and j>=1: btts+=p
-    return {'Expected home goals':round(lh,2),'Expected away goals':round(la,2),'Home win %':round(hw*100,1),'Draw %':round(dr*100,1),'Away win %':round(aw*100,1),'Over 1.5 %':round(ov15*100,1),'Over 2.5 %':round(ov25*100,1),'Under 2.5 %':round(un25*100,1),'BTTS Yes %':round(btts*100,1),'BTTS No %':round((1-btts)*100,1),'Samples':f'{len(hs)} home-team matches; {len(aws)} away-team matches'}
+    if response.status_code == 401:
+        raise RuntimeError("Invalid API token.")
 
-st.title('⚽ Free Football Analysis Dashboard — V3')
-st.write("Today's upcoming fixtures with simple Poisson estimates for 1X2, goals and BTTS. Estimates are not guarantees.")
-with st.sidebar:
-    st.header('Data settings')
-    token=st.text_input('football-data.org API token',type='password',help='Keep this private. Do not upload it to GitHub or send it to anyone.')
-    selected=st.multiselect('Competitions',list(LEAGUES),default=['Premier League (England)','La Liga (Spain)','Bundesliga (Germany)','Serie A (Italy)','Ligue 1 (France)'])
-    days=st.selectbox('Recent-results window (days)',[30,60,90],index=1)
-    go=st.button("Load today's upcoming matches",type='primary')
-if not token:
-    st.info('Open the sidebar using the arrow at top-left and enter your private football-data.org token.')
-    st.stop()
-if go:
-    now=datetime.now(timezone.utc); today=now.date(); start=(today-timedelta(days=days)).isoformat(); end=today.isoformat()
-    rows=[]; errors=[]; bar=st.progress(0)
-    for i,name in enumerate(selected):
-        code=LEAGUES[name]
-        try:
-            day=get(f'/competitions/{code}/matches',token,{'dateFrom':today.isoformat(),'dateTo':today.isoformat()}).get('matches',[])
-            upcoming=[]
-            for m in day:
-                kickoff=datetime.fromisoformat(m['utcDate'].replace('Z','+00:00'))
-                if kickoff>=now and m.get('status') in ('SCHEDULED','TIMED'): upcoming.append(m)
-            if upcoming:
-                hist=get(f'/competitions/{code}/matches',token,{'dateFrom':start,'dateTo':end,'status':'FINISHED'}).get('matches',[])
-                for m in upcoming:
-                    home=m.get('homeTeam',{}).get('name','Home'); away=m.get('awayTeam',{}).get('name','Away')
-                    kick=datetime.fromisoformat(m['utcDate'].replace('Z','+00:00')).astimezone().strftime('%Y-%m-%d %H:%M')
-                    rows.append({'Competition':name,'Kickoff (device time)':kick,'Home team':home,'Away team':away,**predict(hist,home,away)})
-        except Exception as e: errors.append(f'{name}: {e}')
-        bar.progress((i+1)/max(1,len(selected)))
-    if errors:
-        st.warning('Some competitions could not be loaded (often due to free-plan coverage).')
-        for e in errors: st.write('• '+e)
-    if rows:
-        df=pd.DataFrame(rows).sort_values(['Kickoff (device time)','Competition'])
-        st.success(f'Loaded {len(df)} upcoming match(es) for today.')
-        st.dataframe(df,use_container_width=True,hide_index=True)
-        st.download_button('Download analysis as CSV',df.to_csv(index=False).encode(), 'football_analysis_today.csv','text/csv')
-        st.caption('Uses recent completed matches from the same competition and a simple Poisson model. It does not include injuries, line-ups, odds or weather. Verify samples and data coverage before relying on estimates.')
+    if response.status_code == 403:
+        raise RuntimeError(
+            "Your free plan does not include this competition."
+        )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "API request limit reached. Wait before trying again."
+        )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"API error {response.status_code}: {response.text[:200]}"
+        )
+
+    return response.json()
+
+
+# -----------------------------
+# DATE HANDLING
+# -----------------------------
+
+def match_date(match):
+
+    value = match.get("utcDate")
+
+    if not value:
+        return datetime.now(timezone.utc)
+
+    return datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    )
+
+
+# -----------------------------
+# ELO TEAM STRENGTH MODEL
+# -----------------------------
+
+def build_model(history):
+
+    matches = []
+
+    for match in history:
+
+        score = match.get("score", {}).get("fullTime", {})
+
+        if (
+            match.get("status") == "FINISHED"
+            and score.get("home") is not None
+            and score.get("away") is not None
+        ):
+
+            matches.append({
+                "date": match_date(match),
+                "home": match.get("homeTeam", {}).get("name"),
+                "away": match.get("awayTeam", {}).get("name"),
+                "hg": int(score["home"]),
+                "ag": int(score["away"])
+            })
+
+    matches.sort(key=lambda x: x["date"])
+
+    ratings = {}
+    records = {}
+
+    total_home_goals = 0
+    total_away_goals = 0
+
+    for match in matches:
+
+        home = match["home"]
+        away = match["away"]
+
+        hg = match["hg"]
+        ag = match["ag"]
+
+        ratings.setdefault(home, 1500.0)
+        ratings.setdefault(away, 1500.0)
+
+        records.setdefault(home, [])
+        records.setdefault(away, [])
+
+        home_rating = ratings[home]
+        away_rating = ratings[away]
+
+        # Home advantage in Elo points
+        expected_home = 1 / (
+            1 + 10 ** ((away_rating - home_rating - 55) / 400)
+        )
+
+        if hg > ag:
+            actual_home = 1
+
+        elif hg == ag:
+            actual_home = 0.5
+
+        else:
+            actual_home = 0
+
+        # Goal difference adjustment
+        goal_difference = abs(hg - ag)
+
+        adjustment = math.log1p(goal_difference)
+
+        k_factor = 20 * min(adjustment, 1.5)
+
+        change = k_factor * (
+            actual_home - expected_home
+        )
+
+        ratings[home] += change
+        ratings[away] -= change
+
+        # Store team performance
+        if hg > ag:
+            home_points, away_points = 3, 0
+
+        elif hg == ag:
+            home_points, away_points = 1, 1
+
+        else:
+            home_points, away_points = 0, 3
+
+        records[home].append({
+            "date": match["date"],
+            "venue": "home",
+            "gf": hg,
+            "ga": ag,
+            "points": home_points
+        })
+
+        records[away].append({
+            "date": match["date"],
+            "venue": "away",
+            "gf": ag,
+            "ga": hg,
+            "points": away_points
+        })
+
+        total_home_goals += hg
+        total_away_goals += ag
+
+    count = len(matches)
+
+    avg_home = (
+        total_home_goals / count if count else 1.45
+    )
+
+    avg_away = (
+        total_away_goals / count if count else 1.15
+    )
+
+    return {
+        "ratings": ratings,
+        "records": records,
+        "avg_home": avg_home,
+        "avg_away": avg_away,
+        "matches": count
+    }
+
+
+# -----------------------------
+# WEIGHTED TEAM STATISTICS
+# -----------------------------
+
+def weighted_average(records, field):
+
+    if not records:
+        return 0
+
+    now = datetime.now(timezone.utc)
+
+    weighted_total = 0
+    total_weight = 0
+
+    for record in records:
+
+        age = max(
+            0,
+            (now - record["date"]).total_seconds() / 86400
+        )
+
+        # Recent matches receive greater weight.
+        weight = math.exp(
+            -math.log(2) * age / 60
+        )
+
+        weighted_total += record[field] * weight
+        total_weight += weight
+
+    if total_weight == 0:
+        return 0
+
+    return weighted_total / total_weight
+
+
+def team_statistics(model, team, venue):
+
+    records = model["records"].get(team, [])
+
+    if not records:
+        return {
+            "attack": 1.0,
+            "defence": 1.0,
+            "form": 1.35,
+            "samples": 0
+        }
+
+    overall_gf = weighted_average(records, "gf")
+    overall_ga = weighted_average(records, "ga")
+    overall_points = weighted_average(records, "points")
+
+    venue_records = [
+        r for r in records if r["venue"] == venue
+    ]
+
+    if venue_records:
+
+        venue_gf = weighted_average(venue_records, "gf")
+        venue_ga = weighted_average(venue_records, "ga")
+
+        # Shrink small venue samples towards overall performance.
+        factor = len(venue_records) / (
+            len(venue_records) + 5
+        )
+
+        gf = (
+            factor * venue_gf
+            + (1 - factor) * overall_gf
+        )
+
+        ga = (
+            factor * venue_ga
+            + (1 - factor) * overall_ga
+        )
+
     else:
-        st.info('No upcoming matches returned for today in the selected competitions, or your free plan does not include their data. Completed matches are intentionally not shown as upcoming.')
+        gf = overall_gf
+        ga = overall_ga
+
+    if venue == "home":
+        scoring_baseline = model["avg_home"]
+        conceding_baseline = model["avg_away"]
+    else:
+        scoring_baseline = model["avg_away"]
+        conceding_baseline = model["avg_home"]
+
+    attack = gf / max(scoring_baseline, 0.1)
+
+    defence = ga / max(conceding_baseline, 0.1)
+
+    # Recent form: last five matches.
+    recent = sorted(
+        records,
+        key=lambda r: r["date"],
+        reverse=True
+    )[:5]
+
+    form = (
+        sum(r["points"] for r in recent) / len(recent)
+        if recent else overall_points
+    )
+
+    return {
+        "attack": max(0.35, min(2.5, attack)),
+        "defence": max(0.35, min(2.5, defence)),
+        "form": form,
+        "samples": len(venue_records)
+    }
+
+
+# -----------------------------
+# POISSON PROBABILITY
+# -----------------------------
+
+def poisson(lam):
+
+    probabilities = [
+        math.exp(-lam) * lam ** k / math.factorial(k)
+        for k in range(11)
+    ]
+
+    total = sum(probabilities)
+
+    return [p / total for p in probabilities]
+
+
+# -----------------------------
+# MATCH PREDICTION ENGINE
+# -----------------------------
+
+def predict(model, home, away):
+
+    hs = team_statistics(model, home, "home")
+    aws = team_statistics(model, away, "away")
+
+    ratings = model["ratings"]
+
+    home_elo = ratings.get(home, 1500)
+    away_elo = ratings.get(away, 1500)
+
+    # Elo advantage, including home advantage.
+    elo_difference = home_elo + 55 - away_elo
+
+    elo_factor = math.exp(
+        max(-0.25, min(0.25, elo_difference / 3000))
+    )
+
+    # Team attacking and defensive strengths.
+    home_goals = (
+        model["avg_home"]
+        * hs["attack"]
+        * aws["defence"]
+    )
+
+    away_goals = (
+        model["avg_away"]
+        * aws["attack"]
+        * hs["defence"]
+    )
+
+    # Recent form adjustment.
+    home_form_factor = math.exp(
+        (hs["form"] - 1.35) * 0.08
+    )
+
+    away_form_factor = math.exp(
+        (aws["form"] - 1.35) * 0.08
+    )
+
+    # Final expected goals.
+    lh = home_goals * elo_factor * home_form_factor
+
+    la = away_goals / elo_factor * away_form_factor
+
+    lh = max(0.15, min(4.5, lh))
+    la = max(0.15, min(4.5, la))
+
+    ph = poisson(lh)
+    pa = poisson(la)
+
+    hw = dr = aw = 0
+    ov15 = ov25 = ov35 = un25 = btts = 0
+
+    for i, pi in enumerate(ph):
+
+        for j, pj in enumerate(pa):
+
+            probability = pi * pj
+
+            if i > j:
+                hw += probability
+
+            elif i == j:
+                dr += probability
+
+            else:
+                aw += probability
+
+            if i + j >= 2:
+                ov15 += probability
+
+            if i + j >= 3:
+                ov25 += probability
+
+            if i + j >= 4:
+                ov35 += probability
+
+            if i + j <= 2:
+                un25 += probability
+
+            if i >= 1 and j >= 1:
+                btts += probability
+
+    def strength_score(rating):
+
+        return round(
+            max(0, min(100, 50 + (rating - 1500) / 8)),
+            1
+        )
+
+    return {
+
+        "Expected home goals": round(lh, 2),
+        "Expected away goals": round(la, 2),
+
+        "Home Elo": round(home_elo),
+        "Away Elo": round(away_elo),
+
+        "Home strength /100": strength_score(home_elo),
+        "Away strength /100": strength_score(away_elo),
+
+        "Home attack": round(hs["attack"], 2),
+        "Away attack": round(aws["attack"], 2),
+
+        "Home defence": round(hs["defence"], 2),
+        "Away defence": round(aws["defence"], 2),
+
+        "Home form PPG": round(hs["form"], 2),
+        "Away form PPG": round(aws["form"], 2),
+
+        "Home win %": round(hw * 100, 1),
+        "Draw %": round(dr * 100, 1),
+        "Away win %": round(aw * 100, 1),
+
+        "Over 1.5 %": round(ov15 * 100, 1),
+        "Over 2.5 %": round(ov25 * 100, 1),
+        "Over 3.5 %": round(ov35 * 100, 1),
+
+        "Under 2.5 %": round(un25 * 100, 1),
+
+        "BTTS Yes %": round(btts * 100, 1),
+        "BTTS No %": round((1 - btts) * 100, 1),
+
+        "Home samples": hs["samples"],
+        "Away samples": aws["samples"]
+    }
+
+
+# -----------------------------
+# DASHBOARD DISPLAY
+# -----------------------------
+
+st.title("⚽ Football Analysis Dashboard — V4")
+
+st.write(
+    "Team-strength analysis using Elo ratings, "
+    "attacking strength, defensive strength, "
+    "recent form and Poisson probabilities."
+)
+
+with st.sidebar:
+
+    st.header("Data settings")
+
+    token = st.text_input(
+        "football-data.org API token",
+        type="password"
+    )
+
+    selected = st.multiselect(
+        "Competitions",
+        list(LEAGUES),
+        default=[
+            "Premier League (England)",
+            "La Liga (Spain)",
+            "Bundesliga (Germany)",
+            "Serie A (Italy)",
+            "Ligue 1 (France)"
+        ]
+    )
+
+    days = st.selectbox(
+        "Recent-results window (days)",
+        [30, 60, 90],
+        index=1
+    )
+
+    go = st.button(
+        "Load today's upcoming matches",
+        type="primary"
+    )
+
+
+if not token:
+
+    st.info(
+        "Open the sidebar and enter your football-data.org API token."
+    )
+
+    st.stop()
+
+
+if go:
+
+    now = datetime.now(timezone.utc)
+
+    today = now.date()
+
+    start = (
+        today - timedelta(days=days)
+    ).isoformat()
+
+    end = today.isoformat()
+
+    rows = []
+    errors = []
+
+    bar = st.progress(0)
+
+    for i, name in enumerate(selected):
+
+        code = LEAGUES[name]
+
+        try:
+
+            day = get(
+                f"/competitions/{code}/matches",
+                token,
+                {
+                    "dateFrom": today.isoformat(),
+                    "dateTo": today.isoformat()
+                }
+            ).get("matches", [])
+
+            upcoming = []
+
+            for match in day:
+
+                kickoff = match_date(match)
+
+                if (
+                    kickoff >= now
+                    and match.get("status") in (
+                        "SCHEDULED",
+                        "TIMED"
+                    )
+                ):
+
+                    upcoming.append(match)
+
+            if upcoming:
+
+                history = get(
+                    f"/competitions/{code}/matches",
+                    token,
+                    {
+                        "dateFrom": start,
+                        "dateTo": end,
+                        "status": "FINISHED"
+                    }
+                ).get("matches", [])
+
+                model = build_model(history)
+
+                for match in upcoming:
+
+                    home = match.get(
+                        "homeTeam", {}
+                    ).get("name", "Home")
+
+                    away = match.get(
+                        "awayTeam", {}
+                    ).get("name", "Away")
+
+                    kickoff = match_date(match).astimezone().strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+
+                    prediction = predict(
+                        model,
+                        home,
+                        away
+                    )
+
+                    rows.append({
+
+                        "Competition": name,
+
+                        "Kickoff (device time)": kickoff,
+
+                        "Home team": home,
+
+                        "Away team": away,
+
+                        **prediction
+
+                    })
+
+        except Exception as e:
+
+            errors.append(
+                f"{name}: {e}"
+            )
+
+        bar.progress(
+            (i + 1) / max(1, len(selected))
+        )
+
+    if errors:
+
+        st.warning(
+            "Some competitions could not be loaded."
+        )
+
+        for error in errors:
+            st.write("• " + error)
+
+    if rows:
+
+        df = pd.DataFrame(rows)
+
+        df = df.sort_values(
+            ["Kickoff (device time)", "Competition"]
+        )
+
+        st.success(
+            f"Loaded {len(df)} upcoming matches."
+        )
+
+        st.subheader("Today's Match Predictions")
+
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            "Download analysis as CSV",
+            df.to_csv(index=False).encode(),
+            "football_analysis_v4.csv",
+            "text/csv"
+        )
+
+        st.subheader("How to interpret the ratings")
+
+        st.write("""
+        - **Elo:** Higher ratings indicate stronger historical performance.
+        - **Attack:** Above 1.00 indicates above-average scoring.
+        - **Defence:** Below 1.00 indicates fewer goals conceded than average.
+        - **Form PPG:** Points per game over the team's last five matches.
+        - **Expected goals:** Estimated goals for each team.
+        - **Strength /100:** A simplified display of the Elo rating, not a percentage chance of winning.
+        """)
+
+        st.caption(
+            "The model uses completed matches within your selected "
+            "history window. Predictions are estimates, not guarantees. "
+            "It does not yet include injuries, suspensions, confirmed "
+            "lineups, odds or weather. Short history windows can produce "
+            "less reliable ratings."
+        )
+
+    else:
+
+        st.info(
+            "No upcoming matches were returned for today, "
+            "or your API plan does not include the selected competitions."
+        )
+
 else:
-    st.info('Enter your token in the sidebar, select competitions, then tap Load today’s upcoming matches.')
+
+    st.info(
+        "Enter your API token, select competitions "
+        "and tap Load today's upcoming matches."
+    )
